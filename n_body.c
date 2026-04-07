@@ -18,11 +18,10 @@
 #define BODY_COUNT 8
 #define TRAIL_LENGTH 24
 #define DEFAULT_STEPS 0L
-#define DEFAULT_TIME_STEP 0.016f
+#define DEFAULT_TIME_STEP 0.040f
 #define DEFAULT_GRAVITY 3.0f
-#define DEFAULT_SOFTENING 0.015f
+#define DEFAULT_SOFTENING 0.0001f
 #define DEFAULT_RENDER_HZ 60.0
-#define PI_VALUE 3.14159265358979323846
 
 struct screen_size {
   int width;
@@ -268,6 +267,9 @@ static void render_scene(const struct body* bodies, int body_count,
   }
 
   for (i = 0; i < body_count; ++i) {
+    if (bodies[i].mass <= 0.0f) {
+      continue;
+    }
     for (j = 0; j + 1 < bodies[i].trail_count; ++j) {
       int index0;
       int index1;
@@ -291,9 +293,11 @@ static void render_scene(const struct body* bodies, int body_count,
     int center_x;
     int center_y;
 
+    if (bodies[i].mass <= 0.0f) {
+      continue;
+    }
     body_to_subcell(&bodies[i], screen, scale, &center_x, &center_y);
-    draw_braille_circle(cells, screen, center_x, center_y,
-                        (i == 0) ? 3 : 2);
+    draw_braille_circle(cells, screen, center_x, center_y, 2);
   }
 
   move_cursor(1, 1);
@@ -313,33 +317,35 @@ static void render_scene(const struct body* bodies, int body_count,
 static void initialize_bodies(struct body* bodies, int body_count,
                               const struct screen_size* screen, double scale) {
   int i;
-  float center_mass;
+  const float figure8_velocity_scale = (float)sqrt(DEFAULT_GRAVITY);
 
-  center_mass = 28.0f;
   memset(bodies, 0, sizeof(struct body) * (size_t)body_count);
 
-  bodies[0].x = 0.0f;
-  bodies[0].y = 0.0f;
-  bodies[0].vx = 0.0f;
-  bodies[0].vy = 0.0f;
-  bodies[0].mass = center_mass;
+  /* Canonical equal-mass three-body figure-eight initial conditions. */
+  bodies[0].x = -0.97000436f;
+  bodies[0].y = 0.24308753f;
+  bodies[0].vx = 0.46620369f * figure8_velocity_scale;
+  bodies[0].vy = 0.43236573f * figure8_velocity_scale;
+  bodies[0].mass = 1.0f;
 
-  for (i = 1; i < body_count; ++i) {
-    double angle;
-    double radius;
-    double speed;
-    double angle_jitter;
+  bodies[1].x = 0.97000436f;
+  bodies[1].y = -0.24308753f;
+  bodies[1].vx = 0.46620369f * figure8_velocity_scale;
+  bodies[1].vy = 0.43236573f * figure8_velocity_scale;
+  bodies[1].mass = 1.0f;
 
-    angle = (2.0 * PI_VALUE * (double)(i - 1)) / (double)(body_count - 1);
-    angle_jitter = ((double)(i % 2) - 0.5) * 0.08;
-    radius = 0.85 + 0.22 * (double)((i - 1) % 3);
-    speed = sqrt((DEFAULT_GRAVITY * center_mass) / radius) * 0.44;
+  bodies[2].x = 0.0f;
+  bodies[2].y = 0.0f;
+  bodies[2].vx = -0.93240737f * figure8_velocity_scale;
+  bodies[2].vy = -0.86473146f * figure8_velocity_scale;
+  bodies[2].mass = 1.0f;
 
-    bodies[i].x = (float)(cos(angle + angle_jitter) * radius);
-    bodies[i].y = (float)(sin(angle + angle_jitter) * radius);
-    bodies[i].vx = (float)(-sin(angle + angle_jitter) * speed);
-    bodies[i].vy = (float)(cos(angle + angle_jitter) * speed);
-    bodies[i].mass = 0.8f + 0.35f * (float)(i % 3);
+  for (i = 3; i < body_count; ++i) {
+    bodies[i].x = 1000.0f + (float)(i - 3) * 100.0f;
+    bodies[i].y = 1000.0f;
+    bodies[i].vx = 0.0f;
+    bodies[i].vy = 0.0f;
+    bodies[i].mass = 0.0f;
   }
 
   for (i = 0; i < body_count; ++i) {
