@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -15,8 +16,8 @@
 #include "iree/runtime/api.h"
 
 #define BODY_STATE_WIDTH 5
-#define BODY_COUNT 8
 #define TRAIL_LENGTH 24
+#define DEFAULT_BODY_COUNT 3
 #define DEFAULT_STEPS 0L
 #define DEFAULT_TIME_STEP 0.040f
 #define DEFAULT_GRAVITY 3.0f
@@ -43,6 +44,7 @@ struct body {
 struct sim_options {
   long steps;
   int headless;
+  const char* bodies_file_path;
 };
 
 struct runtime_state {
@@ -267,9 +269,6 @@ static void render_scene(const struct body* bodies, int body_count,
   }
 
   for (i = 0; i < body_count; ++i) {
-    if (bodies[i].mass <= 0.0f) {
-      continue;
-    }
     for (j = 0; j + 1 < bodies[i].trail_count; ++j) {
       int index0;
       int index1;
@@ -293,9 +292,6 @@ static void render_scene(const struct body* bodies, int body_count,
     int center_x;
     int center_y;
 
-    if (bodies[i].mass <= 0.0f) {
-      continue;
-    }
     body_to_subcell(&bodies[i], screen, scale, &center_x, &center_y);
     draw_braille_circle(cells, screen, center_x, center_y, 2);
   }
@@ -314,12 +310,13 @@ static void render_scene(const struct body* bodies, int body_count,
   free(cells);
 }
 
-static void initialize_bodies(struct body* bodies, int body_count,
-                              const struct screen_size* screen, double scale) {
+static void initialize_default_bodies(struct body* bodies,
+                                      const struct screen_size* screen,
+                                      double scale) {
   int i;
   const float figure8_velocity_scale = (float)sqrt(DEFAULT_GRAVITY);
 
-  memset(bodies, 0, sizeof(struct body) * (size_t)body_count);
+  memset(bodies, 0, sizeof(struct body) * (size_t)DEFAULT_BODY_COUNT);
 
   /* Canonical equal-mass three-body figure-eight initial conditions. */
   bodies[0].x = -0.97000436f;
@@ -340,15 +337,7 @@ static void initialize_bodies(struct body* bodies, int body_count,
   bodies[2].vy = -0.86473146f * figure8_velocity_scale;
   bodies[2].mass = 1.0f;
 
-  for (i = 3; i < body_count; ++i) {
-    bodies[i].x = 1000.0f + (float)(i - 3) * 100.0f;
-    bodies[i].y = 1000.0f;
-    bodies[i].vx = 0.0f;
-    bodies[i].vy = 0.0f;
-    bodies[i].mass = 0.0f;
-  }
-
-  for (i = 0; i < body_count; ++i) {
+  for (i = 0; i < DEFAULT_BODY_COUNT; ++i) {
     push_trail(&bodies[i], screen, scale);
   }
 }
@@ -399,10 +388,17 @@ static int parse_options(int argc, char** argv, struct sim_options* options) {
 
   options->steps = DEFAULT_STEPS;
   options->headless = 0;
+  options->bodies_file_path = NULL;
 
   for (i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--headless") == 0) {
       options->headless = 1;
+    } else if (strcmp(argv[i], "--bodies-file") == 0) {
+      if (i + 1 >= argc) {
+        return 0;
+      }
+      options->bodies_file_path = argv[i + 1];
+      ++i;
     } else if (strcmp(argv[i], "--steps") == 0) {
       if (i + 1 >= argc || !parse_long(argv[i + 1], &options->steps)) {
         return 0;
@@ -412,6 +408,85 @@ static int parse_options(int argc, char** argv, struct sim_options* options) {
       return 0;
     }
   }
+  return 1;
+}
+
+static int load_bodies_from_file(const char* path, struct body** out_bodies,
+                                 int* out_body_count,
+                                 const struct screen_size* screen,
+                                 double scale) {
+  FILE* file;
+  struct body* bodies;
+  int capacity;
+  int count;
+
+  file = fopen(path, "r");
+  if (file == NULL) {
+    return 0;
+  }
+
+  capacity = 8;
+  count = 0;
+  bodies = (struct body*)calloc((size_t)capacity, sizeof(struct body));
+  if (bodies == NULL) {
+    fclose(file);
+    return 0;
+  }
+
+  for (;;) {
+    float x;
+    float y;
+    float vx;
+    float vy;
+    float mass;
+    int scan_count;
+
+    scan_count = fscanf(file, " %f %f %f %f %f", &x, &y, &vx, &vy, &mass);
+    if (scan_count == EOF) {
+      break;
+    }
+    if (scan_count != BODY_STATE_WIDTH) {
+      free(bodies);
+      fclose(file);
+      return 0;
+    }
+
+    if (count == capacity) {
+      int new_capacity;
+      struct body* new_bodies;
+
+      new_capacity = capacity * 2;
+      new_bodies =
+          (struct body*)realloc(bodies, sizeof(struct body) * (size_t)new_capacity);
+      if (new_bodies == NULL) {
+        free(bodies);
+        fclose(file);
+        return 0;
+      }
+      memset(new_bodies + capacity, 0,
+             sizeof(struct body) * (size_t)(new_capacity - capacity));
+      bodies = new_bodies;
+      capacity = new_capacity;
+    }
+
+    memset(&bodies[count], 0, sizeof(struct body));
+    bodies[count].x = x;
+    bodies[count].y = y;
+    bodies[count].vx = vx;
+    bodies[count].vy = vy;
+    bodies[count].mass = mass;
+    push_trail(&bodies[count], screen, scale);
+    ++count;
+  }
+
+  fclose(file);
+  if (count <= 0) {
+    free(bodies);
+    return 0;
+  }
+
+  *out_bodies = bodies;
+  *out_body_count = count;
   return 1;
 }
 
@@ -649,9 +724,10 @@ int main(int argc, char** argv) {
   struct sim_options options;
   struct screen_size screen;
   struct runtime_state runtime;
-  struct body bodies[BODY_COUNT];
-  float state_in[BODY_COUNT * BODY_STATE_WIDTH];
-  float state_out[BODY_COUNT * BODY_STATE_WIDTH];
+  struct body* bodies;
+  float* state_in;
+  float* state_out;
+  int body_count;
   double scale;
   double render_interval;
   double previous_time;
@@ -661,9 +737,15 @@ int main(int argc, char** argv) {
   iree_status_t status;
 
   IREE_TRACE_APP_ENTER();
+  bodies = NULL;
+  state_in = NULL;
+  state_out = NULL;
+  body_count = 0;
 
   if (!parse_options(argc, argv, &options)) {
-    fprintf(stderr, "usage: %s [--steps N|N] [--headless]\n", argv[0]);
+    fprintf(stderr,
+            "usage: %s [--steps N|N] [--headless] [--bodies-file PATH]\n",
+            argv[0]);
     IREE_TRACE_APP_EXIT(1);
     return 1;
   }
@@ -678,12 +760,47 @@ int main(int argc, char** argv) {
   screen = detect_screen_size();
   scale = ((screen.width < screen.height) ? screen.width : screen.height) * 0.30;
   render_interval = 1.0 / DEFAULT_RENDER_HZ;
-  initialize_bodies(bodies, BODY_COUNT, &screen, scale);
+  if (options.bodies_file_path != NULL) {
+    if (!load_bodies_from_file(options.bodies_file_path, &bodies, &body_count,
+                               &screen, scale)) {
+      fprintf(stderr,
+              "failed to load body state from '%s' as whitespace-delimited x y vx vy mass rows\n",
+              options.bodies_file_path);
+      IREE_TRACE_APP_EXIT(1);
+      return 1;
+    }
+  } else {
+    body_count = DEFAULT_BODY_COUNT;
+    bodies = (struct body*)calloc((size_t)body_count, sizeof(struct body));
+    if (bodies == NULL) {
+      fprintf(stderr, "failed to allocate default body state\n");
+      IREE_TRACE_APP_EXIT(1);
+      return 1;
+    }
+    initialize_default_bodies(bodies, &screen, scale);
+  }
+
+  state_in =
+      (float*)malloc(sizeof(float) * (size_t)body_count * BODY_STATE_WIDTH);
+  state_out =
+      (float*)malloc(sizeof(float) * (size_t)body_count * BODY_STATE_WIDTH);
+  if (state_in == NULL || state_out == NULL) {
+    fprintf(stderr, "failed to allocate simulation buffers for %d bodies\n",
+            body_count);
+    free(state_in);
+    free(state_out);
+    free(bodies);
+    IREE_TRACE_APP_EXIT(1);
+    return 1;
+  }
 
   status = initialize_runtime(&runtime);
   if (!iree_status_is_ok(status)) {
     iree_status_fprint(stderr, status);
     iree_status_ignore(status);
+    free(state_in);
+    free(state_out);
+    free(bodies);
     IREE_TRACE_APP_EXIT(1);
     return 1;
   }
@@ -700,8 +817,8 @@ int main(int argc, char** argv) {
   }
 
   while (keep_running && (options.steps <= 0 || step_index < options.steps)) {
-    pack_bodies(bodies, BODY_COUNT, state_in);
-    status = simulation_step(runtime.session, state_in, BODY_COUNT,
+    pack_bodies(bodies, body_count, state_in);
+    status = simulation_step(runtime.session, state_in, body_count,
                              DEFAULT_GRAVITY, DEFAULT_SOFTENING,
                              DEFAULT_TIME_STEP, state_out);
     if (!iree_status_is_ok(status)) {
@@ -711,7 +828,7 @@ int main(int argc, char** argv) {
       break;
     }
 
-    unpack_bodies(bodies, BODY_COUNT, state_out, &screen, scale);
+    unpack_bodies(bodies, body_count, state_out, &screen, scale);
     ++step_index;
 
     if (!options.headless) {
@@ -729,7 +846,7 @@ int main(int argc, char** argv) {
       render_accumulator += elapsed;
       if (render_accumulator >= render_interval) {
         printf("\033[2J\033[H");
-        render_scene(bodies, BODY_COUNT, &screen, scale, step_index);
+        render_scene(bodies, body_count, &screen, scale, step_index);
         render_accumulator = 0.0;
       }
       if (keep_running && render_accumulator < render_interval) {
@@ -743,8 +860,11 @@ int main(int argc, char** argv) {
     printf("\033[?25h\n");
     fflush(stdout);
   }
-  print_final_state(bodies, BODY_COUNT, step_index);
+  print_final_state(bodies, body_count, step_index);
   deinitialize_runtime(&runtime);
+  free(state_in);
+  free(state_out);
+  free(bodies);
 
   IREE_TRACE_APP_EXIT(exit_code);
   return exit_code;
