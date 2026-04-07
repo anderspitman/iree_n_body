@@ -259,6 +259,7 @@ static void render_scene(const struct body* bodies, int body_count,
                          const struct screen_size* screen, double scale,
                          long step_index) {
   unsigned int* cells;
+  float max_mass;
   int i;
   int j;
 
@@ -266,6 +267,16 @@ static void render_scene(const struct body* bodies, int body_count,
                                 sizeof(unsigned int));
   if (cells == NULL) {
     return;
+  }
+
+  max_mass = 0.0f;
+  for (i = 0; i < body_count; ++i) {
+    if (bodies[i].mass > max_mass) {
+      max_mass = bodies[i].mass;
+    }
+  }
+  if (max_mass <= 0.0f) {
+    max_mass = 1.0f;
   }
 
   for (i = 0; i < body_count; ++i) {
@@ -291,9 +302,14 @@ static void render_scene(const struct body* bodies, int body_count,
   for (i = 0; i < body_count; ++i) {
     int center_x;
     int center_y;
+    int radius;
 
     body_to_subcell(&bodies[i], screen, scale, &center_x, &center_y);
-    draw_braille_circle(cells, screen, center_x, center_y, 2);
+    radius = 1 + (int)(2.0f * sqrtf(bodies[i].mass / max_mass));
+    if (radius < 0.1) {
+      radius = 0.1;
+    }
+    draw_braille_circle(cells, screen, center_x, center_y, radius);
   }
 
   move_cursor(1, 1);
