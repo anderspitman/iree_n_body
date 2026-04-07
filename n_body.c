@@ -44,7 +44,9 @@ struct body {
 struct sim_options {
   long steps;
   int headless;
+  const char* backend;
   const char* bodies_file_path;
+  const char* vmfb_path;
 };
 
 struct runtime_state {
@@ -54,6 +56,12 @@ struct runtime_state {
 
 static volatile sig_atomic_t keep_running = 1;
 static char g_vmfb_path[1024];
+
+static int is_supported_backend(const char* backend) {
+  return strcmp(backend, "local-task") == 0 ||
+         strcmp(backend, "local-sync") == 0 ||
+         strcmp(backend, "vulkan") == 0 || strcmp(backend, "cuda") == 0;
+}
 
 static void handle_signal(int signum) {
   (void)signum;
@@ -257,7 +265,7 @@ static void push_trail(struct body* body, const struct screen_size* screen,
 
 static void render_scene(const struct body* bodies, int body_count,
                          const struct screen_size* screen, double scale,
-                         long step_index) {
+                         long step_index, const char* backend) {
   unsigned int* cells;
   float max_mass;
   int i;
@@ -319,8 +327,8 @@ static void render_scene(const struct body* bodies, int body_count,
     }
     putchar('\n');
   }
-  printf("step=%ld  bodies=%d  backend=local-task  tracy=enabled  Ctrl-C quits",
-         step_index, body_count);
+  printf("step=%ld  bodies=%d  backend=%s  tracy=enabled  Ctrl-C quits",
+         step_index, body_count, backend);
   fflush(stdout);
 
   free(cells);
@@ -404,16 +412,30 @@ static int parse_options(int argc, char** argv, struct sim_options* options) {
 
   options->steps = DEFAULT_STEPS;
   options->headless = 0;
+  options->backend = "local-task";
   options->bodies_file_path = NULL;
+  options->vmfb_path = NULL;
 
   for (i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--headless") == 0) {
       options->headless = 1;
+    } else if (strcmp(argv[i], "--backend") == 0) {
+      if (i + 1 >= argc || !is_supported_backend(argv[i + 1])) {
+        return 0;
+      }
+      options->backend = argv[i + 1];
+      ++i;
     } else if (strcmp(argv[i], "--bodies-file") == 0) {
       if (i + 1 >= argc) {
         return 0;
       }
       options->bodies_file_path = argv[i + 1];
+      ++i;
+    } else if (strcmp(argv[i], "--vmfb") == 0) {
+      if (i + 1 >= argc) {
+        return 0;
+      }
+      options->vmfb_path = argv[i + 1];
       ++i;
     } else if (strcmp(argv[i], "--steps") == 0) {
       if (i + 1 >= argc || !parse_long(argv[i + 1], &options->steps)) {
@@ -568,16 +590,44 @@ static int join_path(char* out_path, size_t out_size, const char* left,
   return 1;
 }
 
-static int locate_vmfb(const char* argv0) {
+static int locate_vmfb(const char* argv0, const struct sim_options* options) {
   char binary_dir[1024];
   char cwd_vmfb_path[1024];
   char bin_vmfb_path[1024];
+  char backend_vmfb_name[1024];
+  char cwd_backend_vmfb_path[1024];
+  char bin_backend_vmfb_path[1024];
+
+  if (options->vmfb_path != NULL) {
+    if (file_exists(options->vmfb_path)) {
+      strcpy(g_vmfb_path, options->vmfb_path);
+      return 1;
+    }
+    return 0;
+  }
 
   detect_binary_dir(argv0, binary_dir, sizeof(binary_dir));
   snprintf(cwd_vmfb_path, sizeof(cwd_vmfb_path), "n_body.vmfb");
+  snprintf(backend_vmfb_name, sizeof(backend_vmfb_name), "n_body_%s.vmfb",
+           options->backend);
+  snprintf(cwd_backend_vmfb_path, sizeof(cwd_backend_vmfb_path), "%s",
+           backend_vmfb_name);
   if (!join_path(bin_vmfb_path, sizeof(bin_vmfb_path), binary_dir,
                  "n_body.vmfb")) {
     bin_vmfb_path[0] = '\0';
+  }
+  if (!join_path(bin_backend_vmfb_path, sizeof(bin_backend_vmfb_path),
+                 binary_dir, backend_vmfb_name)) {
+    bin_backend_vmfb_path[0] = '\0';
+  }
+
+  if (file_exists(cwd_backend_vmfb_path)) {
+    strcpy(g_vmfb_path, cwd_backend_vmfb_path);
+    return 1;
+  }
+  if (bin_backend_vmfb_path[0] != '\0' && file_exists(bin_backend_vmfb_path)) {
+    strcpy(g_vmfb_path, bin_backend_vmfb_path);
+    return 1;
   }
 
   if (file_exists(cwd_vmfb_path)) {
@@ -668,7 +718,8 @@ static iree_status_t simulation_step(iree_runtime_session_t* session,
   return status;
 }
 
-static iree_status_t initialize_runtime(struct runtime_state* runtime) {
+static iree_status_t initialize_runtime(struct runtime_state* runtime,
+                                        const char* backend) {
   iree_runtime_instance_options_t instance_options;
   iree_runtime_session_options_t session_options;
   iree_hal_device_t* device;
@@ -684,7 +735,7 @@ static iree_status_t initialize_runtime(struct runtime_state* runtime) {
                                         &runtime->instance);
   if (iree_status_is_ok(status)) {
     status = iree_runtime_instance_try_create_default_device(
-        runtime->instance, iree_make_cstring_view("local-task"), &device);
+        runtime->instance, iree_make_cstring_view(backend), &device);
   }
   if (iree_status_is_ok(status)) {
     iree_runtime_session_options_initialize(&session_options);
@@ -760,15 +811,16 @@ int main(int argc, char** argv) {
 
   if (!parse_options(argc, argv, &options)) {
     fprintf(stderr,
-            "usage: %s [--steps N|N] [--headless] [--bodies-file PATH]\n",
+            "usage: %s [--steps N|N] [--headless] [--backend BACKEND] [--bodies-file PATH] [--vmfb PATH]\n",
             argv[0]);
     IREE_TRACE_APP_EXIT(1);
     return 1;
   }
 
-  if (!locate_vmfb(argv[0])) {
+  if (!locate_vmfb(argv[0], &options)) {
     fprintf(stderr,
-            "could not locate n_body.vmfb in the current directory or next to the executable\n");
+            "could not locate a VMFB for backend '%s'; expected n_body_%s.vmfb or n_body.vmfb in the current directory or next to the executable\n",
+            options.backend, options.backend);
     IREE_TRACE_APP_EXIT(1);
     return 1;
   }
@@ -810,7 +862,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  status = initialize_runtime(&runtime);
+  status = initialize_runtime(&runtime, options.backend);
   if (!iree_status_is_ok(status)) {
     iree_status_fprint(stderr, status);
     iree_status_ignore(status);
@@ -862,7 +914,8 @@ int main(int argc, char** argv) {
       render_accumulator += elapsed;
       if (render_accumulator >= render_interval) {
         printf("\033[2J\033[H");
-        render_scene(bodies, body_count, &screen, scale, step_index);
+        render_scene(bodies, body_count, &screen, scale, step_index,
+                     options.backend);
         render_accumulator = 0.0;
       }
       if (keep_running && render_accumulator < render_interval) {
