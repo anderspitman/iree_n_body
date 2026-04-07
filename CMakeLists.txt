@@ -15,18 +15,7 @@ set(TRACY_TIMER_FALLBACK ON CACHE BOOL "" FORCE)
 
 add_subdirectory(third_party/iree EXCLUDE_FROM_ALL)
 
-set(N_BODY_IREE_COMPILE_DEFAULT "${CMAKE_SOURCE_DIR}/.venv/bin/iree-compile")
-if(NOT EXISTS "${N_BODY_IREE_COMPILE_DEFAULT}")
-  set(N_BODY_IREE_COMPILE_DEFAULT "iree-compile")
-endif()
-
 add_executable(n_body n_body.c)
 set_property(TARGET n_body PROPERTY C_STANDARD 11)
 set_property(TARGET n_body PROPERTY C_STANDARD_REQUIRED ON)
-target_compile_definitions(
-  n_body
-  PRIVATE
-    N_BODY_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    N_BODY_IREE_COMPILE="${N_BODY_IREE_COMPILE_DEFAULT}"
-)
 target_link_libraries(n_body PRIVATE iree::runtime::unified m)

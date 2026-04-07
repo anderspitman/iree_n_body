@@ -52,6 +52,7 @@ struct runtime_state {
 };
 
 static volatile sig_atomic_t keep_running = 1;
+static char g_vmfb_path[1024];
 
 static void handle_signal(int signum) {
   (void)signum;
@@ -408,51 +409,89 @@ static int parse_options(int argc, char** argv, struct sim_options* options) {
   return 1;
 }
 
-static int is_source_newer(const char* source_path, const char* binary_path) {
-  struct stat source_stat;
-  struct stat binary_stat;
-
-  if (stat(source_path, &source_stat) != 0) {
-    return 1;
-  }
-  if (stat(binary_path, &binary_stat) != 0) {
-    return 1;
-  }
-  return source_stat.st_mtime >= binary_stat.st_mtime;
+static int file_exists(const char* path) {
+  struct stat st;
+  return stat(path, &st) == 0;
 }
 
-static int ensure_vmfb(void) {
-  char command[4096];
-  const char* compile_tool;
-  const char* override_tool;
-  const char* source_dir;
-  char mlir_path[1024];
-  char vmfb_path[1024];
-  int result;
+static void directory_from_path(const char* path, char* out_dir, size_t out_size) {
+  size_t i;
+  size_t last_slash;
 
-  source_dir = N_BODY_SOURCE_DIR;
-  sprintf(mlir_path, "%s/n_body.mlir", source_dir);
-  sprintf(vmfb_path, "%s/n_body.vmfb", source_dir);
+  last_slash = 0;
+  out_dir[0] = '.';
+  out_dir[1] = '\0';
+  for (i = 0; path[i] != '\0'; ++i) {
+    if (path[i] == '/') {
+      last_slash = i + 1;
+    }
+  }
+  if (last_slash == 0) {
+    return;
+  }
+  if (last_slash >= out_size) {
+    last_slash = out_size - 1;
+  }
+  memcpy(out_dir, path, last_slash);
+  out_dir[last_slash] = '\0';
+  if (last_slash > 1 && out_dir[last_slash - 1] == '/') {
+    out_dir[last_slash - 1] = '\0';
+  }
+}
 
-  if (!is_source_newer(mlir_path, vmfb_path)) {
-    return 1;
+static void detect_binary_dir(const char* argv0, char* out_dir, size_t out_size) {
+  ssize_t length;
+  char exe_path[1024];
+
+  length = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+  if (length > 0) {
+    exe_path[length] = '\0';
+    directory_from_path(exe_path, out_dir, out_size);
+    return;
+  }
+  directory_from_path(argv0, out_dir, out_size);
+}
+
+static int join_path(char* out_path, size_t out_size, const char* left,
+                     const char* right) {
+  size_t left_len;
+  size_t right_len;
+  size_t total_len;
+
+  left_len = strlen(left);
+  right_len = strlen(right);
+  total_len = left_len + 1 + right_len + 1;
+  if (total_len > out_size) {
+    return 0;
+  }
+  memcpy(out_path, left, left_len);
+  out_path[left_len] = '/';
+  memcpy(out_path + left_len + 1, right, right_len);
+  out_path[left_len + 1 + right_len] = '\0';
+  return 1;
+}
+
+static int locate_vmfb(const char* argv0) {
+  char binary_dir[1024];
+  char cwd_vmfb_path[1024];
+  char bin_vmfb_path[1024];
+
+  detect_binary_dir(argv0, binary_dir, sizeof(binary_dir));
+  snprintf(cwd_vmfb_path, sizeof(cwd_vmfb_path), "n_body.vmfb");
+  if (!join_path(bin_vmfb_path, sizeof(bin_vmfb_path), binary_dir,
+                 "n_body.vmfb")) {
+    bin_vmfb_path[0] = '\0';
   }
 
-  override_tool = getenv("N_BODY_IREE_COMPILE");
-  compile_tool = override_tool && override_tool[0] ? override_tool : N_BODY_IREE_COMPILE;
-  sprintf(
-      command,
-      "\"%s\" \"%s\" -o \"%s\" "
-      "--iree-hal-target-device=local "
-      "--iree-hal-local-target-device-backends=llvm-cpu "
-      "--iree-vm-bytecode-module-strip-source-map=true "
-      "--iree-vm-emit-polyglot-zip=false",
-      compile_tool, mlir_path, vmfb_path);
-
-  fprintf(stdout, "Compiling %s -> %s\n", mlir_path, vmfb_path);
-  fflush(stdout);
-  result = system(command);
-  return result == 0;
+  if (file_exists(cwd_vmfb_path)) {
+    strcpy(g_vmfb_path, cwd_vmfb_path);
+    return 1;
+  }
+  if (bin_vmfb_path[0] != '\0' && file_exists(bin_vmfb_path)) {
+    strcpy(g_vmfb_path, bin_vmfb_path);
+    return 1;
+  }
+  return 0;
 }
 
 static iree_status_t append_input_state(iree_runtime_call_t* call,
@@ -560,11 +599,9 @@ static iree_status_t initialize_runtime(struct runtime_state* runtime) {
   iree_hal_device_release(device);
 
   if (iree_status_is_ok(status)) {
-    char vmfb_path[1024];
-    sprintf(vmfb_path, "%s/n_body.vmfb", N_BODY_SOURCE_DIR);
     status =
         iree_runtime_session_append_bytecode_module_from_file(runtime->session,
-                                                              vmfb_path);
+                                                              g_vmfb_path);
   }
 
   if (!iree_status_is_ok(status)) {
@@ -625,8 +662,9 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (!ensure_vmfb()) {
-    fprintf(stderr, "failed to compile n_body.mlir with %s\n", N_BODY_IREE_COMPILE);
+  if (!locate_vmfb(argv[0])) {
+    fprintf(stderr,
+            "could not locate n_body.vmfb in the current directory or next to the executable\n");
     IREE_TRACE_APP_EXIT(1);
     return 1;
   }
