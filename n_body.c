@@ -1,0 +1,707 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
+#include <math.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "iree/base/tracing.h"
+#include "iree/runtime/api.h"
+
+#define BODY_STATE_WIDTH 5
+#define BODY_COUNT 8
+#define TRAIL_LENGTH 24
+#define DEFAULT_STEPS 0L
+#define DEFAULT_TIME_STEP 0.016f
+#define DEFAULT_GRAVITY 3.0f
+#define DEFAULT_SOFTENING 0.015f
+#define DEFAULT_RENDER_HZ 60.0
+#define PI_VALUE 3.14159265358979323846
+
+struct screen_size {
+  int width;
+  int height;
+};
+
+struct body {
+  float x;
+  float y;
+  float vx;
+  float vy;
+  float mass;
+  int trail_x[TRAIL_LENGTH];
+  int trail_y[TRAIL_LENGTH];
+  int trail_count;
+  int trail_next;
+};
+
+struct sim_options {
+  long steps;
+  int headless;
+};
+
+struct runtime_state {
+  iree_runtime_instance_t* instance;
+  iree_runtime_session_t* session;
+};
+
+static volatile sig_atomic_t keep_running = 1;
+
+static void handle_signal(int signum) {
+  (void)signum;
+  keep_running = 0;
+}
+
+static double now_seconds(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static void sleep_seconds(double seconds) {
+  struct timespec request;
+  struct timespec remaining;
+
+  if (seconds <= 0.0) {
+    return;
+  }
+
+  request.tv_sec = (time_t)seconds;
+  request.tv_nsec = (long)((seconds - (double)request.tv_sec) * 1000000000.0);
+  if (request.tv_nsec < 0L) {
+    request.tv_nsec = 0L;
+  }
+
+  while (nanosleep(&request, &remaining) != 0) {
+    if (errno != EINTR || !keep_running) {
+      break;
+    }
+    request = remaining;
+  }
+}
+
+static void move_cursor(int row, int column) {
+  printf("\033[%d;%dH", row, column);
+}
+
+static struct screen_size detect_screen_size(void) {
+  struct screen_size size;
+  struct winsize ws;
+
+  size.width = 80;
+  size.height = 24;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+    if (ws.ws_col > 0) {
+      size.width = (int)ws.ws_col;
+    }
+    if (ws.ws_row > 0) {
+      size.height = (int)ws.ws_row;
+    }
+  }
+
+  if (size.width < 20) {
+    size.width = 20;
+  }
+  if (size.height < 10) {
+    size.height = 10;
+  }
+  return size;
+}
+
+static void write_braille_cell(unsigned int mask) {
+  unsigned int codepoint;
+  char utf8[4];
+
+  if (mask == 0U) {
+    putchar(' ');
+    return;
+  }
+
+  codepoint = 0x2800U + mask;
+  utf8[0] = (char)(0xE0U | ((codepoint >> 12) & 0x0FU));
+  utf8[1] = (char)(0x80U | ((codepoint >> 6) & 0x3FU));
+  utf8[2] = (char)(0x80U | (codepoint & 0x3FU));
+  utf8[3] = '\0';
+  fputs(utf8, stdout);
+}
+
+static void set_braille_dot(unsigned int* cells, const struct screen_size* screen,
+                            int sub_x, int sub_y) {
+  static const unsigned int dot_bits[4][2] = {{0x01U, 0x08U},
+                                              {0x02U, 0x10U},
+                                              {0x04U, 0x20U},
+                                              {0x40U, 0x80U}};
+  int cell_x;
+  int cell_y;
+  int dot_x;
+  int dot_y;
+
+  if (sub_x < 0 || sub_x >= screen->width * 2 || sub_y < 0 ||
+      sub_y >= screen->height * 4) {
+    return;
+  }
+
+  cell_x = sub_x / 2;
+  cell_y = sub_y / 4;
+  dot_x = sub_x % 2;
+  dot_y = sub_y % 4;
+  cells[cell_y * screen->width + cell_x] |= dot_bits[dot_y][dot_x];
+}
+
+static void draw_braille_line(unsigned int* cells, const struct screen_size* screen,
+                              int x0, int y0, int x1, int y1) {
+  int dx;
+  int dy;
+  int sx;
+  int sy;
+  int err;
+
+  dx = (x0 < x1) ? (x1 - x0) : (x0 - x1);
+  dy = (y0 < y1) ? (y1 - y0) : (y0 - y1);
+  sx = (x0 < x1) ? 1 : -1;
+  sy = (y0 < y1) ? 1 : -1;
+  err = dx - dy;
+
+  for (;;) {
+    int twice_err;
+    set_braille_dot(cells, screen, x0, y0);
+    if (x0 == x1 && y0 == y1) {
+      break;
+    }
+    twice_err = err * 2;
+    if (twice_err > -dy) {
+      err -= dy;
+      x0 += sx;
+    }
+    if (twice_err < dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
+}
+
+static void draw_braille_circle(unsigned int* cells,
+                                const struct screen_size* screen, int center_x,
+                                int center_y, int radius) {
+  int dy;
+  int radius_sq;
+
+  radius_sq = radius * radius;
+  for (dy = -radius; dy <= radius; ++dy) {
+    int dx_limit_sq;
+
+    dx_limit_sq = radius_sq - dy * dy;
+    if (dx_limit_sq >= 0) {
+      int dx_limit;
+      int dx;
+
+      dx_limit = (int)(sqrt((double)dx_limit_sq) + 0.5);
+      for (dx = -dx_limit; dx <= dx_limit; ++dx) {
+        set_braille_dot(cells, screen, center_x + dx, center_y + dy);
+      }
+    }
+  }
+}
+
+static void body_to_subcell(const struct body* body,
+                            const struct screen_size* screen, double scale,
+                            int* sub_x, int* sub_y) {
+  *sub_x = (int)((screen->width * 0.5 + (double)body->x * scale) * 2.0 + 0.5);
+  *sub_y =
+      (int)((screen->height * 0.5 + (double)body->y * scale) * 4.0 + 0.5);
+
+  if (*sub_x < 0) {
+    *sub_x = 0;
+  } else if (*sub_x > screen->width * 2 - 1) {
+    *sub_x = screen->width * 2 - 1;
+  }
+  if (*sub_y < 0) {
+    *sub_y = 0;
+  } else if (*sub_y > screen->height * 4 - 1) {
+    *sub_y = screen->height * 4 - 1;
+  }
+}
+
+static void push_trail(struct body* body, const struct screen_size* screen,
+                       double scale) {
+  int sub_x;
+  int sub_y;
+  int last_index;
+
+  body_to_subcell(body, screen, scale, &sub_x, &sub_y);
+  if (body->trail_count > 0) {
+    last_index = body->trail_next - 1;
+    if (last_index < 0) {
+      last_index += TRAIL_LENGTH;
+    }
+    if (body->trail_x[last_index] == sub_x && body->trail_y[last_index] == sub_y) {
+      return;
+    }
+  }
+
+  body->trail_x[body->trail_next] = sub_x;
+  body->trail_y[body->trail_next] = sub_y;
+  body->trail_next = (body->trail_next + 1) % TRAIL_LENGTH;
+  if (body->trail_count < TRAIL_LENGTH) {
+    body->trail_count += 1;
+  }
+}
+
+static void render_scene(const struct body* bodies, int body_count,
+                         const struct screen_size* screen, double scale,
+                         long step_index) {
+  unsigned int* cells;
+  int i;
+  int j;
+
+  cells = (unsigned int*)calloc((size_t)(screen->width * screen->height),
+                                sizeof(unsigned int));
+  if (cells == NULL) {
+    return;
+  }
+
+  for (i = 0; i < body_count; ++i) {
+    for (j = 0; j + 1 < bodies[i].trail_count; ++j) {
+      int index0;
+      int index1;
+
+      index0 = bodies[i].trail_next - bodies[i].trail_count + j;
+      if (index0 < 0) {
+        index0 += TRAIL_LENGTH;
+      }
+      index1 = index0 + 1;
+      if (index1 >= TRAIL_LENGTH) {
+        index1 = 0;
+      }
+
+      draw_braille_line(cells, screen, bodies[i].trail_x[index0],
+                        bodies[i].trail_y[index0], bodies[i].trail_x[index1],
+                        bodies[i].trail_y[index1]);
+    }
+  }
+
+  for (i = 0; i < body_count; ++i) {
+    int center_x;
+    int center_y;
+
+    body_to_subcell(&bodies[i], screen, scale, &center_x, &center_y);
+    draw_braille_circle(cells, screen, center_x, center_y,
+                        (i == 0) ? 3 : 2);
+  }
+
+  move_cursor(1, 1);
+  for (i = 0; i < screen->height - 1; ++i) {
+    for (j = 0; j < screen->width; ++j) {
+      write_braille_cell(cells[i * screen->width + j]);
+    }
+    putchar('\n');
+  }
+  printf("step=%ld  bodies=%d  backend=local-task  tracy=enabled  Ctrl-C quits",
+         step_index, body_count);
+  fflush(stdout);
+
+  free(cells);
+}
+
+static void initialize_bodies(struct body* bodies, int body_count,
+                              const struct screen_size* screen, double scale) {
+  int i;
+  float center_mass;
+
+  center_mass = 28.0f;
+  memset(bodies, 0, sizeof(struct body) * (size_t)body_count);
+
+  bodies[0].x = 0.0f;
+  bodies[0].y = 0.0f;
+  bodies[0].vx = 0.0f;
+  bodies[0].vy = 0.0f;
+  bodies[0].mass = center_mass;
+
+  for (i = 1; i < body_count; ++i) {
+    double angle;
+    double radius;
+    double speed;
+    double angle_jitter;
+
+    angle = (2.0 * PI_VALUE * (double)(i - 1)) / (double)(body_count - 1);
+    angle_jitter = ((double)(i % 2) - 0.5) * 0.08;
+    radius = 0.85 + 0.22 * (double)((i - 1) % 3);
+    speed = sqrt((DEFAULT_GRAVITY * center_mass) / radius) * 0.44;
+
+    bodies[i].x = (float)(cos(angle + angle_jitter) * radius);
+    bodies[i].y = (float)(sin(angle + angle_jitter) * radius);
+    bodies[i].vx = (float)(-sin(angle + angle_jitter) * speed);
+    bodies[i].vy = (float)(cos(angle + angle_jitter) * speed);
+    bodies[i].mass = 0.8f + 0.35f * (float)(i % 3);
+  }
+
+  for (i = 0; i < body_count; ++i) {
+    push_trail(&bodies[i], screen, scale);
+  }
+}
+
+static void pack_bodies(const struct body* bodies, int body_count, float* state) {
+  int i;
+  for (i = 0; i < body_count; ++i) {
+    int base;
+    base = i * BODY_STATE_WIDTH;
+    state[base + 0] = bodies[i].x;
+    state[base + 1] = bodies[i].y;
+    state[base + 2] = bodies[i].vx;
+    state[base + 3] = bodies[i].vy;
+    state[base + 4] = bodies[i].mass;
+  }
+}
+
+static void unpack_bodies(struct body* bodies, int body_count, const float* state,
+                          const struct screen_size* screen, double scale) {
+  int i;
+  for (i = 0; i < body_count; ++i) {
+    int base;
+    base = i * BODY_STATE_WIDTH;
+    bodies[i].x = state[base + 0];
+    bodies[i].y = state[base + 1];
+    bodies[i].vx = state[base + 2];
+    bodies[i].vy = state[base + 3];
+    bodies[i].mass = state[base + 4];
+    push_trail(&bodies[i], screen, scale);
+  }
+}
+
+static int parse_long(const char* text, long* out_value) {
+  char* end;
+  long value;
+
+  errno = 0;
+  value = strtol(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0') {
+    return 0;
+  }
+  *out_value = value;
+  return 1;
+}
+
+static int parse_options(int argc, char** argv, struct sim_options* options) {
+  int i;
+
+  options->steps = DEFAULT_STEPS;
+  options->headless = 0;
+
+  for (i = 1; i < argc; ++i) {
+    if (strcmp(argv[i], "--headless") == 0) {
+      options->headless = 1;
+    } else if (strcmp(argv[i], "--steps") == 0) {
+      if (i + 1 >= argc || !parse_long(argv[i + 1], &options->steps)) {
+        return 0;
+      }
+      ++i;
+    } else if (!parse_long(argv[i], &options->steps)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static int is_source_newer(const char* source_path, const char* binary_path) {
+  struct stat source_stat;
+  struct stat binary_stat;
+
+  if (stat(source_path, &source_stat) != 0) {
+    return 1;
+  }
+  if (stat(binary_path, &binary_stat) != 0) {
+    return 1;
+  }
+  return source_stat.st_mtime >= binary_stat.st_mtime;
+}
+
+static int ensure_vmfb(void) {
+  char command[4096];
+  const char* compile_tool;
+  const char* override_tool;
+  const char* source_dir;
+  char mlir_path[1024];
+  char vmfb_path[1024];
+  int result;
+
+  source_dir = N_BODY_SOURCE_DIR;
+  sprintf(mlir_path, "%s/n_body.mlir", source_dir);
+  sprintf(vmfb_path, "%s/n_body.vmfb", source_dir);
+
+  if (!is_source_newer(mlir_path, vmfb_path)) {
+    return 1;
+  }
+
+  override_tool = getenv("N_BODY_IREE_COMPILE");
+  compile_tool = override_tool && override_tool[0] ? override_tool : N_BODY_IREE_COMPILE;
+  sprintf(
+      command,
+      "\"%s\" \"%s\" -o \"%s\" "
+      "--iree-hal-target-device=local "
+      "--iree-hal-local-target-device-backends=llvm-cpu "
+      "--iree-vm-bytecode-module-strip-source-map=true "
+      "--iree-vm-emit-polyglot-zip=false",
+      compile_tool, mlir_path, vmfb_path);
+
+  fprintf(stdout, "Compiling %s -> %s\n", mlir_path, vmfb_path);
+  fflush(stdout);
+  result = system(command);
+  return result == 0;
+}
+
+static iree_status_t append_input_state(iree_runtime_call_t* call,
+                                        iree_runtime_session_t* session,
+                                        const float* state, int body_count) {
+  iree_hal_buffer_view_t* input_view;
+  const iree_hal_dim_t shape[2] = {(iree_hal_dim_t)body_count,
+                                   (iree_hal_dim_t)BODY_STATE_WIDTH};
+  iree_hal_buffer_params_t params;
+
+  input_view = NULL;
+  memset(&params, 0, sizeof(params));
+  params.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL;
+  params.access = IREE_HAL_MEMORY_ACCESS_ALL;
+  params.usage = IREE_HAL_BUFFER_USAGE_DEFAULT;
+
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_allocate_buffer_copy(
+      iree_runtime_session_device(session),
+      iree_runtime_session_device_allocator(session), IREE_ARRAYSIZE(shape), shape,
+      IREE_HAL_ELEMENT_TYPE_FLOAT_32, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+      params, iree_make_const_byte_span((void*)state,
+                                        (iree_host_size_t)(sizeof(float) * body_count *
+                                                           BODY_STATE_WIDTH)),
+      &input_view));
+  {
+    iree_status_t status;
+    status = iree_runtime_call_inputs_push_back_buffer_view(call, input_view);
+    iree_hal_buffer_view_release(input_view);
+    return status;
+  }
+}
+
+static iree_status_t append_input_scalar(iree_runtime_call_t* call, float value) {
+  iree_vm_value_t scalar_value;
+  scalar_value = iree_vm_value_make_f32(value);
+  return iree_vm_list_push_value(iree_runtime_call_inputs(call), &scalar_value);
+}
+
+static iree_status_t simulation_step(iree_runtime_session_t* session,
+                                     const float* in_state, int body_count,
+                                     float gravity, float softening, float dt,
+                                     float* out_state) {
+  iree_runtime_call_t call;
+  iree_hal_buffer_view_t* output_view;
+  iree_status_t status;
+
+  output_view = NULL;
+  IREE_RETURN_IF_ERROR(iree_runtime_call_initialize_by_name(
+      session, iree_make_cstring_view("module.step"), &call));
+
+  status = append_input_state(&call, session, in_state, body_count);
+  if (iree_status_is_ok(status)) {
+    status = append_input_scalar(&call, gravity);
+  }
+  if (iree_status_is_ok(status)) {
+    status = append_input_scalar(&call, softening);
+  }
+  if (iree_status_is_ok(status)) {
+    status = append_input_scalar(&call, dt);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_invoke(&call, 0);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_call_outputs_pop_front_buffer_view(&call, &output_view);
+  }
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_device_transfer_d2h(
+        iree_runtime_session_device(session),
+        iree_hal_buffer_view_buffer(output_view), 0, out_state,
+        (iree_device_size_t)(sizeof(float) * body_count * BODY_STATE_WIDTH),
+        IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout());
+  }
+
+  iree_hal_buffer_view_release(output_view);
+  iree_runtime_call_deinitialize(&call);
+  return status;
+}
+
+static iree_status_t initialize_runtime(struct runtime_state* runtime) {
+  iree_runtime_instance_options_t instance_options;
+  iree_runtime_session_options_t session_options;
+  iree_hal_device_t* device;
+  iree_status_t status;
+
+  device = NULL;
+  runtime->instance = NULL;
+  runtime->session = NULL;
+
+  iree_runtime_instance_options_initialize(&instance_options);
+  iree_runtime_instance_options_use_all_available_drivers(&instance_options);
+  status = iree_runtime_instance_create(&instance_options, iree_allocator_system(),
+                                        &runtime->instance);
+  if (iree_status_is_ok(status)) {
+    status = iree_runtime_instance_try_create_default_device(
+        runtime->instance, iree_make_cstring_view("local-task"), &device);
+  }
+  if (iree_status_is_ok(status)) {
+    iree_runtime_session_options_initialize(&session_options);
+    status = iree_runtime_session_create_with_device(
+        runtime->instance, &session_options, device,
+        iree_runtime_instance_host_allocator(runtime->instance),
+        &runtime->session);
+  }
+  iree_hal_device_release(device);
+
+  if (iree_status_is_ok(status)) {
+    char vmfb_path[1024];
+    sprintf(vmfb_path, "%s/n_body.vmfb", N_BODY_SOURCE_DIR);
+    status =
+        iree_runtime_session_append_bytecode_module_from_file(runtime->session,
+                                                              vmfb_path);
+  }
+
+  if (!iree_status_is_ok(status)) {
+    if (runtime->session != NULL) {
+      iree_runtime_session_release(runtime->session);
+      runtime->session = NULL;
+    }
+    if (runtime->instance != NULL) {
+      iree_runtime_instance_release(runtime->instance);
+      runtime->instance = NULL;
+    }
+  }
+  return status;
+}
+
+static void deinitialize_runtime(struct runtime_state* runtime) {
+  if (runtime->session != NULL) {
+    iree_runtime_session_release(runtime->session);
+    runtime->session = NULL;
+  }
+  if (runtime->instance != NULL) {
+    iree_runtime_instance_release(runtime->instance);
+    runtime->instance = NULL;
+  }
+}
+
+static void print_final_state(const struct body* bodies, int body_count,
+                              long step_index) {
+  int i;
+  printf("final_state steps=%ld\n", step_index);
+  for (i = 0; i < body_count; ++i) {
+    printf("%d %.6f %.6f %.6f %.6f %.6f\n", i, (double)bodies[i].x,
+           (double)bodies[i].y, (double)bodies[i].vx, (double)bodies[i].vy,
+           (double)bodies[i].mass);
+  }
+}
+
+int main(int argc, char** argv) {
+  struct sim_options options;
+  struct screen_size screen;
+  struct runtime_state runtime;
+  struct body bodies[BODY_COUNT];
+  float state_in[BODY_COUNT * BODY_STATE_WIDTH];
+  float state_out[BODY_COUNT * BODY_STATE_WIDTH];
+  double scale;
+  double render_interval;
+  double previous_time;
+  double render_accumulator;
+  long step_index;
+  int exit_code;
+  iree_status_t status;
+
+  IREE_TRACE_APP_ENTER();
+
+  if (!parse_options(argc, argv, &options)) {
+    fprintf(stderr, "usage: %s [--steps N|N] [--headless]\n", argv[0]);
+    IREE_TRACE_APP_EXIT(1);
+    return 1;
+  }
+
+  if (!ensure_vmfb()) {
+    fprintf(stderr, "failed to compile n_body.mlir with %s\n", N_BODY_IREE_COMPILE);
+    IREE_TRACE_APP_EXIT(1);
+    return 1;
+  }
+
+  screen = detect_screen_size();
+  scale = ((screen.width < screen.height) ? screen.width : screen.height) * 0.30;
+  render_interval = 1.0 / DEFAULT_RENDER_HZ;
+  initialize_bodies(bodies, BODY_COUNT, &screen, scale);
+
+  status = initialize_runtime(&runtime);
+  if (!iree_status_is_ok(status)) {
+    iree_status_fprint(stderr, status);
+    iree_status_ignore(status);
+    IREE_TRACE_APP_EXIT(1);
+    return 1;
+  }
+
+  signal(SIGINT, handle_signal);
+  exit_code = 0;
+  step_index = 0;
+  previous_time = now_seconds();
+  render_accumulator = render_interval;
+
+  if (!options.headless) {
+    printf("\033[2J\033[H\033[?25l");
+    fflush(stdout);
+  }
+
+  while (keep_running && (options.steps <= 0 || step_index < options.steps)) {
+    pack_bodies(bodies, BODY_COUNT, state_in);
+    status = simulation_step(runtime.session, state_in, BODY_COUNT,
+                             DEFAULT_GRAVITY, DEFAULT_SOFTENING,
+                             DEFAULT_TIME_STEP, state_out);
+    if (!iree_status_is_ok(status)) {
+      iree_status_fprint(stderr, status);
+      iree_status_ignore(status);
+      exit_code = 1;
+      break;
+    }
+
+    unpack_bodies(bodies, BODY_COUNT, state_out, &screen, scale);
+    ++step_index;
+
+    if (!options.headless) {
+      double current_time;
+      double elapsed;
+
+      current_time = now_seconds();
+      elapsed = current_time - previous_time;
+      previous_time = current_time;
+      if (elapsed < 0.0) {
+        elapsed = 0.0;
+      } else if (elapsed > 0.25) {
+        elapsed = 0.25;
+      }
+      render_accumulator += elapsed;
+      if (render_accumulator >= render_interval) {
+        printf("\033[2J\033[H");
+        render_scene(bodies, BODY_COUNT, &screen, scale, step_index);
+        render_accumulator = 0.0;
+      }
+      if (keep_running && render_accumulator < render_interval) {
+        sleep_seconds(render_interval - render_accumulator);
+      }
+    }
+  }
+
+  if (!options.headless) {
+    move_cursor(screen.height, 1);
+    printf("\033[?25h\n");
+    fflush(stdout);
+  }
+  print_final_state(bodies, BODY_COUNT, step_index);
+  deinitialize_runtime(&runtime);
+
+  IREE_TRACE_APP_EXIT(exit_code);
+  return exit_code;
+}
