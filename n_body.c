@@ -885,6 +885,7 @@ int main(int argc, char** argv) {
   }
 
   while (keep_running && (options.steps <= 0 || step_index < options.steps)) {
+    IREE_TRACE_ZONE_BEGIN_NAMED(z0, "SimulationFrame");
     pack_bodies(bodies, body_count, state_in);
     status = simulation_step(runtime.session, state_in, body_count,
                              DEFAULT_GRAVITY, DEFAULT_SOFTENING,
@@ -893,6 +894,7 @@ int main(int argc, char** argv) {
       iree_status_fprint(stderr, status);
       iree_status_ignore(status);
       exit_code = 1;
+      IREE_TRACE_ZONE_END(z0);
       break;
     }
 
@@ -922,6 +924,9 @@ int main(int argc, char** argv) {
         sleep_seconds(render_interval - render_accumulator);
       }
     }
+
+    IREE_TRACE_FRAME_MARK();
+    IREE_TRACE_ZONE_END(z0);
   }
 
   if (!options.headless) {
